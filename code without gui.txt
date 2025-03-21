@@ -1,0 +1,236 @@
+import os
+import sys
+import re
+import string
+import pickle
+import math
+import nltk
+from nltk.stem import PorterStemmer
+from collections import defaultdict
+
+# Download required NLTK data
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+#######################################
+# Preprocessing Functions
+#######################################
+
+def tokenize(text):
+    """Tokenize text after removing punctuation and digits."""
+    translator = str.maketrans('', '', string.punctuation)
+    text = text.translate(translator)
+    text = ''.join([ch for ch in text if not ch.isdigit()])
+    return nltk.word_tokenize(text.lower())
+
+def get_stopwords(stopwords_file='Stopword-List.txt'):
+    """Read stopwords from a file (one per line)."""
+    with open(stopwords_file, 'r') as f:
+        stopwords = [word.strip() for word in f.read().splitlines() if word.strip()]
+    return set(stopwords)
+
+def preprocess_text(text, stopwords):
+    """Preprocess a text: tokenize, remove stopwords, and stem."""
+    tokens = tokenize(text)
+    tokens = [t for t in tokens if t not in stopwords and len(t) > 2]
+    stemmer = PorterStemmer()
+    stemmed = [stemmer.stem(token) for token in tokens]
+    return [token for token in stemmed if token not in stopwords]
+
+def parse_document(contents):
+    """
+    Modified to always return the entire file content (in lowercase).
+    Ignores <title> and <text> tags since your files do not contain them.
+    """
+    return contents.lower()
+
+def read_documents(folder_path):
+    """
+    Reads all documents from a folder.
+    Returns a dictionary mapping document IDs to document text.
+    Document ID is extracted from the filename (digits only) or the filename itself.
+    """
+    documents = {}
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        try:
+            with open(file_path, 'r', encoding='cp1252') as f:
+                content = f.read()
+            doc_text = parse_document(content)
+            doc_id = re.sub(r'\D', "", filename)
+            if doc_id == "":
+                doc_id = filename
+            else:
+                doc_id = int(doc_id)
+            documents[doc_id] = doc_text
+        except Exception as e:
+            print(f"Error reading {file_path}: {e}")
+    return documents
+
+def preprocess_documents(documents, stopwords):
+    """
+    Preprocess each document and return a dictionary mapping docID to list of processed tokens.
+    """
+    preprocessed = {}
+    for doc_id, text in documents.items():
+        preprocessed[doc_id] = preprocess_text(text, stopwords)
+    return preprocessed
+
+#######################################
+# Index Construction
+#######################################
+
+def generate_inverted_index(preprocessed_docs):
+    """
+    Generates an inverted index from preprocessed documents.
+    Returns a dictionary mapping term -> set of document IDs.
+    """
+    index = defaultdict(set)
+    for doc_id, tokens in preprocessed_docs.items():
+        for token in tokens:
+            index[token].add(doc_id)
+    return dict(index)
+
+def generate_positional_index(preprocessed_docs):
+    """
+    Generates a positional index from preprocessed documents.
+    Returns a dictionary mapping term -> {docID: [positions]}.
+    """
+    pos_index = defaultdict(lambda: defaultdict(list))
+    for doc_id, tokens in preprocessed_docs.items():
+        for pos, token in enumerate(tokens):
+            pos_index[token][doc_id].append(pos)
+    return {term: dict(postings) for term, postings in pos_index.items()}
+
+#######################################
+# Query Processing
+#######################################
+
+def boolean_query(query, inverted_index, stopwords):
+    """
+    Processes a Boolean query using the inverted index.
+    Supports operators: AND, OR, NOT.
+    Defaults to AND if no operator is specified.
+    Preprocesses each term using the same pipeline.
+    """
+    tokens = nltk.word_tokenize(query)
+    stemmer = PorterStemmer()
+    result = None
+    op = None
+
+    for token in tokens:
+        token_upper = token.upper()
+        if token_upper in ("AND", "OR", "NOT"):
+            op = token_upper
+        else:
+            term = token.lower()
+            term = stemmer.stem(term)
+            posting = set(inverted_index.get(term, []))
+            if result is None:
+                result = posting
+            else:
+                if op == "AND":
+                    result = result.intersection(posting)
+                elif op == "OR":
+                    result = result.union(posting)
+                elif op == "NOT":
+                    result = result.difference(posting)
+                else:
+                    result = result.intersection(posting)
+            op = None
+
+    if result is None:
+        result = set()
+    return result
+
+def proximity_query(query, positional_index, stopwords):
+    """
+    Processes a proximity query.
+    Expected format: "term1 term2/k" or "term1 term2 k" where k is an integer.
+    Returns the set of document IDs where term1 and term2 appear within k words of each other.
+    """
+    if "/" in query:
+        parts = query.split("/")
+        try:
+            k = int(parts[1].strip())
+        except ValueError:
+            print("Invalid proximity value.")
+            return set()
+        terms_part = parts[0].strip()
+        terms = nltk.word_tokenize(terms_part)
+    else:
+        tokens = nltk.word_tokenize(query)
+        if len(tokens) < 3:
+            print("Proximity query must have two terms and an integer distance.")
+            return set()
+        terms = tokens[:2]
+        try:
+            k = int(tokens[2])
+        except ValueError:
+            print("Third argument must be an integer for proximity.")
+            return set()
+    
+    stemmer = PorterStemmer()
+    term1 = stemmer.stem(terms[0].lower())
+    term2 = stemmer.stem(terms[1].lower())
+
+    results = set()
+    postings1 = positional_index.get(term1, {})
+    postings2 = positional_index.get(term2, {})
+
+    common_docs = set(postings1.keys()).intersection(postings2.keys())
+    for doc in common_docs:
+        positions1 = postings1[doc]
+        positions2 = postings2[doc]
+        for p1 in positions1:
+            for p2 in positions2:
+                if p1 != p2 and abs(p1 - p2) <= k:
+                    results.add(doc)
+                    break
+    return results
+
+def process_query(query, inverted_index, positional_index, stopwords):
+    """
+    Determines if the query is a Boolean or a proximity query and processes accordingly.
+    Uses proximity processing only if the query contains a '/'.
+    """
+    if "/" in query:
+        return proximity_query(query, positional_index, stopwords)
+    else:
+        return boolean_query(query, inverted_index, stopwords)
+
+#######################################
+# Main Execution (Interactive)
+#######################################
+
+if __name__ == "__main__":
+    # Usage: python combined_index.py <documents_folder>
+    if len(sys.argv) < 2:
+        print("Usage: python combined_index.py <documents_folder>")
+        sys.exit(1)
+    
+    docs_folder = sys.argv[1]
+    
+    # Load stopwords (expects Stopword-List.txt in current directory)
+    stopwords = get_stopwords()
+    
+    # Read and preprocess documents
+    documents = read_documents(docs_folder)
+    preprocessed_docs = preprocess_documents(documents, stopwords)
+    
+    # Generate indexes
+    inverted_index = generate_inverted_index(preprocessed_docs)
+    positional_index = generate_positional_index(preprocessed_docs)
+    
+    print("Indexes built. You can now enter queries interactively.")
+    print("For Boolean queries, use operators AND, OR, NOT (e.g., 'term1 AND term2').")
+    print("For Proximity queries, use the format 'term1 term2/k' or 'term1 term2 k' (e.g., 'data mining/3').")
+    print("Type '/exit' to quit.\n")
+    
+    while True:
+        user_query = input("Enter query: ").strip()
+        if user_query.lower() == "/exit":
+            break
+        result_docs = process_query(user_query, inverted_index, positional_index, stopwords)
+        print("Documents Retrieved:", sorted(result_docs))
+        print("-" * 40)
